@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>University of Mumbai Result PDF → JSON</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f4f6f8;
+      padding: 30px;
+    }
+
+    h2 {
+      margin-bottom: 10px;
+    }
+
+    input, button {
+      padding: 10px;
+      margin: 5px 0;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    pre {
+      background: #111;
+      color: #0f0;
+      padding: 15px;
+      margin-top: 20px;
+      max-height: 400px;
+      overflow-y: auto;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+
+  <h2>📄 University of Mumbai Result PDF → JSON</h2>
+
+  <input type="file" id="pdfFile" accept="application/pdf">
+  <br>
+
+  <button onclick="generateJSON()">Generate JSON</button>
+  <button onclick="downloadJSON()">Download JSON</button>
+
+  <pre id="output">Waiting for PDF...</pre>
+
+  <script>
+    let latestJSON = null;
+
+    async function generateJSON() {
+      const fileInput = document.getElementById("pdfFile");
+      const output = document.getElementById("output");
+
+      if (!fileInput.files.length) {
+        alert("Please select a PDF file first.");
+        return;
+      }
+
+      output.textContent = "Uploading PDF and processing...";
+
+      const formData = new FormData();
+      formData.append("file", fileInput.files[0]);
+
+      try {
+        const response = await fetch(
+          "https://YOUR-RAILWAY-URL-HERE/parse",
+          {
+            method: "POST",
+            body: formData
+          }
+        );
+
+        const data = await response.json();
+        latestJSON = data;
+
+        output.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        output.textContent = "Error: " + err.message;
+      }
+    }
+
+    function downloadJSON() {
+      if (!latestJSON) {
+        alert("Generate JSON first.");
+        return;
+      }
+
+      const blob = new Blob(
+        [JSON.stringify(latestJSON, null, 2)],
+        { type: "application/json" }
+      );
+
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = "mu_result.json";
+      a.click();
+    }
+  </script>
+
+</body>
+</html>
