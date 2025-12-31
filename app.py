@@ -1,147 +1,163 @@
 import pdfplumber
 import re
-import json
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
-import tempfile
 import os
+import tempfile
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-def extract_office_register_data(pdf_path):
-    extracted_data = {
-        "university": "University of Mumbai",
-        "type": "Office Register",
-        "students": []
-    }
-
+def parse_office_register(pdf_path):
+    students = []
+    
     with pdfplumber.open(pdf_path) as pdf:
-        for page_num, page in enumerate(pdf.pages):
-            # 1. Extract words with vertical (top) positions
-            words = page.extract_words(x_tolerance=2, y_tolerance=2)
-            
-            # 2. Group words into lines (rows) based on 'top' position
-            # We allow a small tolerance (e.g., 5 units) to group words on the same visual line
+        for page in pdf.pages:
+            # 1. Extract words and cluster them into lines (rows) based on vertical position
+            words = page.extract_words(x_tolerance=3, y_tolerance=3)
             lines = {}
-            for word in words:
-                y = round(word['top'] / 5) * 5
+            for w in words:
+                # Group words that are roughly on the same Y-axis (within 5 units)
+                y = round(w['top'] / 5) * 5
                 if y not in lines:
                     lines[y] = []
-                lines[y].append(word)
-
-            # Sort lines by vertical position
-            sorted_y = sorted(lines.keys())
+                lines[y].append(w)
             
-            # 3. Iterate through lines to find Student Blocks
-            # A student block typically starts with a Seat Number (7 digits)
-            current_student = {}
+            # Sort rows from top to bottom
+            sorted_y_keys = sorted(lines.keys())
             
-            for y in sorted_y:
-                # Sort words in this line from left to right
+            # 2. Process rows to find Students
+            current_student = None
+            
+            for y in sorted_y_keys:
+                # Sort words in the line from left to right
                 line_words = sorted(lines[y], key=lambda w: w['x0'])
                 line_text = " ".join([w['text'] for w in line_words])
-
-                # PATTERN: Detect Seat Number (Start of new student)
-                seat_match = re.search(r"(\d{7,})", line_text)
                 
-                # If we find a new seat number, save the previous student and start a new one
-                if seat_match and float(line_words[0]['x0']) < 100: # Ensure it's on the left side
+                # --- DETECTION LOGIC ---
+                
+                # IGNORE Header Rows: Pattern like "(1102311)" or "OFFICE REGISTER"
+                if re.match(r"^\(\d+\)", line_text) or "OFFICE REGISTER" in line_text:
+                    continue
+
+                # DETECT NEW STUDENT: Starts with 7 digits (e.g., 262112648)
+                # We use strict regex `^\d{7}` to ensure it starts the line.
+                seat_match = re.match(r"^(\d{7})\b", line_text)
+                
+                if seat_match:
+                    # Save previous student if exists
                     if current_student:
-                        extracted_data["students"].append(current_student)
+                        students.append(current_student)
                     
+                    seat_no = seat_match.group(1)
+                    
+                    # Initialize new student object
                     current_student = {
-                        "seat_no": seat_match.group(1),
+                        "seat_no": seat_no,
                         "name": "",
                         "ern": "",
                         "status": "Unknown",
                         "total_marks": "N/A",
                         "sgpa": "N/A",
+                        "grade": "N/A",
                         "result": "N/A"
                     }
                     
-                    # Attempt to get name from the same line (text after seat no)
-                    # Cleaning common noise words from name area
-                    raw_name = line_text.replace(current_student['seat_no'], "").strip()
-                    # Filter out purely numeric or short tokens
-                    name_parts = [p for p in raw_name.split() if not p.isdigit() and len(p) > 1]
-                    current_student["name"] = " ".join(name_parts)
+                    # EXTRACT NAME from the same line
+                    # Remove the Seat No to get the Name
+                    # Text is usually: "262112648 NAME OF STUDENT"
+                    raw_name_text = line_text[len(seat_no):].strip()
+                    current_student["name"] = clean_name(raw_name_text)
 
-                # Processing data INSIDE a student block
+                # --- DATA EXTRACTION (Inside a student block) ---
                 if current_student:
-                    # Capture Name continuation (if name wraps to next line)
-                    # Heuristic: Line has no digits, is uppercase, and we just started the block
-                    if not re.search(r"\d", line_text) and len(line_text) > 3 and "COLLEGE" not in line_text:
-                         if len(current_student["name"]) < 15: # Name probably incomplete
-                             current_student["name"] += " " + line_text
-
-                    # Capture ERN
+                    # 1. ERN Detection (starts with MU)
                     ern_match = re.search(r"(MU\d{10,})", line_text)
-                    if ern_match:
+                    if ern_match and not current_student["ern"]:
                         current_student["ern"] = ern_match.group(1)
+                    
+                    # 2. Name Continuation
+                    # If line has NO digits and consists of Uppercase words, it might be part of the name
+                    # (But ignore keywords like COLLEGE, FEMALE, etc.)
+                    if (not re.search(r"\d", line_text) 
+                        and len(line_text) > 2 
+                        and "COLLEGE" not in line_text 
+                        and "FEMALE" not in line_text 
+                        and "MALE" not in line_text):
+                        
+                        # Only append if name looks short/incomplete
+                        if len(current_student["name"]) < 20: 
+                            current_student["name"] += " " + line_text.strip()
 
-                    # Capture Gender/Status
-                    if "FEMALE" in line_text:
-                        current_student["gender"] = "FEMALE"
-                    if "MALE" in line_text and "FEMALE" not in line_text:
-                        current_student["gender"] = "MALE"
+                    # 3. Status (Regular/Repeat)
                     if "Regular" in line_text:
                         current_student["status"] = "Regular"
-
-                    # Capture Total Marks
-                    # Pattern: (Total) usually appears as "(374)" or similar near "PASS"
-                    total_match = re.search(r"\((\d{3})\)", line_text)
-                    if total_match:
-                        current_student["total_marks"] = total_match.group(1)
-
-                    # Capture Result
+                    
+                    # 4. Result (PASS/FAIL/ABSENT)
                     if "PASS" in line_text:
                         current_student["result"] = "PASS"
                     elif "FAILED" in line_text or "FAILS" in line_text:
                         current_student["result"] = "FAILED"
                     elif "ABSENT" in line_text:
                         current_student["result"] = "ABSENT"
-
-                    # Capture SGPA
-                    # Usually a float at the end of the block (e.g. 7.27273)
-                    # We look for a float that is NOT part of course credits (usually 2.0, 4.0)
-                    # SGPA is often > 0 and < 10 (or 20 in some systems, but typically < 10 here)
-                    floats = re.findall(r"\b(\d+\.\d+)\b", line_text)
-                    if floats:
-                        # Take the last float found in the block, often the SGPA
-                        for f in floats:
-                            val = float(f)
-                            # Basic validation for SGPA range
-                            if 0.0 <= val <= 10.0: 
-                                current_student["sgpa"] = f
+                        
+                    # 5. SGPA / Grade Points
+                    # Usually a decimal at the end of the block, e.g., "7.27"
+                    # We look for a float that is reasonable for a GPA (0.00 to 10.00)
+                    floats = re.findall(r"\b\d+\.\d+\b", line_text)
+                    for f in floats:
+                        val = float(f)
+                        if 0.0 <= val <= 10.0:
+                            current_student["sgpa"] = f
+                            
+                    # 6. Total Marks (often in brackets like (374))
+                    total_match = re.search(r"\((\d{3})\)", line_text)
+                    if total_match:
+                        current_student["total_marks"] = total_match.group(1)
 
             # Append the last student found on the page
             if current_student:
-                extracted_data["students"].append(current_student)
+                students.append(current_student)
 
-    # Clean up Names (Remove common noise like "Mother Name" if present or stray chars)
-    for s in extracted_data["students"]:
-        s["name"] = s["name"].replace("Regular", "").replace("FEMALE", "").replace("MALE", "").strip()
+    # Final Cleanup
+    for s in students:
+        s["name"] = clean_name(s["name"])
 
-    return extracted_data
+    return students
 
-@app.route('/parse', methods=['POST'])
+def clean_name(name_str):
+    """Removes noise words from the Name field."""
+    noise_words = ["FEMALE", "MALE", "Regular", "Student", "Previous", "Marks"]
+    for w in noise_words:
+        name_str = name_str.replace(w, "")
+    
+    # Remove extra spaces and non-alpha characters from ends
+    return re.sub(r'\s+', ' ', name_str).strip()
+
+@app.route("/parse", methods=["POST"])
 def parse_pdf():
-    if 'file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        file.save(tmp.name)
-        try:
-            data = extract_office_register_data(tmp.name)
-            return jsonify(data)
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-        finally:
-            os.unlink(tmp.name)
+    file = request.files["file"]
+    
+    # Save uploaded file temporarily
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    file.save(temp.name)
+    temp.close()
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    try:
+        data = parse_office_register(temp.name)
+        return jsonify({
+            "status": "success",
+            "count": len(data),
+            "data": data
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if os.path.exists(temp.name):
+            os.unlink(temp.name)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
