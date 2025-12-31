@@ -1,40 +1,39 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pdfplumber
+import tempfile
+import os
 
 app = Flask(__name__)
 CORS(app)
 
-@app.route("/")
-def home():
-    return "MU Result Parser API running on Railway"
-
 @app.route("/parse", methods=["POST"])
 def parse_pdf():
-    try:
-        if "file" not in request.files:
-            return jsonify({"error": "No file uploaded"})
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
 
-        file = request.files["file"]
-        pages_info = []
+    file = request.files["file"]
 
-        with pdfplumber.open(file) as pdf:
-            for i, page in enumerate(pdf.pages):
-                text = page.extract_text()
-                pages_info.append({
-                    "page": i + 1,
-                    "has_text": bool(text),
-                    "char_count": len(text) if text else 0
-                })
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        file.save(tmp.name)
+        pdf_path = tmp.name
 
-        return jsonify({
-            "status": "ok",
-            "total_pages": len(pages_info),
-            "pages": pages_info
-        })
+    pages_data = []
 
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        })
+    with pdfplumber.open(pdf_path) as pdf:
+        for i, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            pages_data.append({
+                "page": i,
+                "char_count": len(text),
+                "has_text": bool(text.strip()),
+                "text": text
+            })
+
+    os.remove(pdf_path)
+
+    return jsonify({
+        "status": "ok",
+        "total_pages": len(pages_data),
+        "pages": pages_data
+    })
