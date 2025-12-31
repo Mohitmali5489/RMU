@@ -18,51 +18,51 @@ def parse_pdf():
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     file.save(temp.name)
 
-    lines = []
+    words = []
 
-    # ---- Extract text line-by-line ----
+    # -------- Extract WORDS (not lines) --------
     with pdfplumber.open(temp.name) as pdf:
         for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                for l in text.splitlines():
-                    clean = re.sub(r"\s+", " ", l).strip()
-                    if clean:
-                        lines.append(clean)
+            page_words = page.extract_words(use_text_flow=True)
+            for w in page_words:
+                text = w["text"].strip()
+                if text:
+                    words.append(text)
 
     os.unlink(temp.name)
 
     students = []
     seen = set()
-
     i = 0
-    while i < len(lines):
-        line = lines[i]
 
-        # Seat number = standalone 7+ digit number
-        if re.fullmatch(r"\d{7,}", line):
-            seat_no = line
+    while i < len(words):
+        word = words[i]
 
-            name = ""
+        # Seat number = 7+ digit number
+        if re.fullmatch(r"\d{7,}", word):
+            seat_no = word
+            name_parts = []
             gender = ""
             ern = ""
             status = ""
 
-            # Look ahead safely
-            for j in range(i + 1, min(i + 8, len(lines))):
-                l = lines[j]
+            # Look ahead next 15 words
+            for j in range(i + 1, min(i + 15, len(words))):
+                w = words[j]
 
-                if not name and re.fullmatch(r"[A-Z][A-Z\s]{3,}", l):
-                    name = l
+                if w in ("MALE", "FEMALE"):
+                    gender = w
 
-                if not gender and l in ("MALE", "FEMALE"):
-                    gender = l
+                elif w.upper() in ("REGULAR", "PRIVATE"):
+                    status = w.title()
 
-                if not ern and re.match(r"MU\d{10,}", l):
-                    ern = l
+                elif re.fullmatch(r"MU\d{10,}", w):
+                    ern = w
 
-                if not status and l.upper() in ("REGULAR", "PRIVATE"):
-                    status = l.title()
+                elif re.fullmatch(r"[A-Z]{2,}", w):
+                    name_parts.append(w)
+
+            name = " ".join(name_parts).strip()
 
             if seat_no not in seen and name:
                 students.append({
@@ -74,7 +74,9 @@ def parse_pdf():
                 })
                 seen.add(seat_no)
 
-        i += 1
+            i += 15
+        else:
+            i += 1
 
     return jsonify({
         "status": "success",
