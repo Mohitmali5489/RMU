@@ -1,96 +1,76 @@
-import re
-import io
-import pdfplumber
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import pdfplumber
+import re
+import tempfile
+import os
 
 app = Flask(__name__)
 CORS(app)
 
-# ---------- HELPERS ----------
+# -------------------------------
+# PDF TEXT EXTRACTION
+# -------------------------------
+def extract_text_from_pdf(pdf_path):
+    full_text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            txt = page.extract_text()
+            if txt:
+                full_text += "\n" + txt
+    return full_text
 
+
+# -------------------------------
+# STUDENT PARSER (ROBUST)
+# -------------------------------
 def extract_students_from_text(text):
     students = []
 
-    # 🔒 Only process text AFTER student table header
-    header_match = re.search(
-        r"SEAT NO\s+NAME\s+STATUS\s+GENDER\s+ERN\s+COLLEGE",
-        text
-    )
-    if not header_match:
+    # 🔒 Start from FIRST real student row
+    start_match = re.search(r"\n\d{7,8}\s+[A-Z]{2,}\s+[A-Z]{2,}", text)
+    if not start_match:
         return students
 
-    text = text[header_match.end():]
+    text = text[start_match.start():]
 
-    # Split by real student seat numbers (7–8 digits, newline before)
+    # Split per student
     blocks = re.split(r"\n(?=\d{7,8}\s+[A-Z]{2,}\s+[A-Z]{2,})", text)
 
     for block in blocks:
         block = block.strip()
 
-        # ❌ Skip subject header rows
-        if ":" in block:
+        # Skip noise / subject headers
+        if ":" in block and "MU-" not in block:
             continue
 
-        # --- Seat No + Full Name ---
+        # Seat No + Name
         m = re.match(r"^(\d{7,8})\s+([A-Z]{2,}(?:\s+[A-Z]{2,})+)", block)
         if not m:
             continue
 
         seat_no = m.group(1)
-        name = m.group(2).strip()
+        name = m.group(2)
 
-        # --- Gender ---
-        gender = None
-        if re.search(r"\bMALE\b", block):
-            gender = "MALE"
-        elif re.search(r"\bFEMALE\b", block):
-            gender = "FEMALE"
-
-        # --- Status ---
-        status = "Regular" if " Regular " in block else None
-
-        # --- Result ---
-        result = None
-        if re.search(r"\bPASS\b", block):
-            result = "PASS"
-        elif re.search(r"\bFAIL\b", block):
-            result = "FAIL"
-
-        # --- Total Marks ---
-        total_marks = None
-        tm = re.search(r"MARKS\s*\(?(\d+)\)?", block)
-        if tm:
-            total_marks = int(tm.group(1))
-
-        # --- SGPA ---
-        sgpa = None
-        sg = re.search(r"SGPA[:\s]+([\d.]+)", block)
-        if sg:
-            sgpa = float(sg.group(1))
-
-        # --- College ---
-        college = None
-        col = re.search(r"MU-\d+:(.+)", block)
-        if col:
-            college = col.group(1).strip()
-
-        # --- Subjects ---
-        subjects = []
-        subject_pattern = re.compile(
-            r"(\d{6,7})\s+([A-Za-z &()-]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+([A+BCDEF]+)\s+(\d+)"
+        gender = (
+            "MALE" if " MALE " in block else
+            "FEMALE" if " FEMALE " in block else None
         )
 
-        for sm in subject_pattern.finditer(block):
-            subjects.append({
-                "code": sm.group(1),
-                "name": sm.group(2).strip(),
-                "internal": int(sm.group(3)),
-                "external": int(sm.group(4)),
-                "total": int(sm.group(5)),
-                "grade": sm.group(6),
-                "credits": int(sm.group(7))
-            })
+        status = "Regular" if " Regular " in block else None
+        result = (
+            "PASS" if " PASS " in block else
+            "FAIL" if " FAIL " in block else None
+        )
+
+        tm = re.search(r"MARKS\s*\(?(\d+)\)?", block)
+        total_marks = int(tm.group(1)) if tm else None
+
+        sg = re.search(r"SGPA[:\s]+([\d.]+)", block)
+        sgpa = float(sg.group(1)) if sg else None
+
+        col = re.search(r"MU-\d+:(.+)", block)
+        college = col.group(1).strip() if col else None
 
         students.append({
             "seat_no": seat_no,
@@ -101,37 +81,42 @@ def extract_students_from_text(text):
             "result": result,
             "total_marks": total_marks,
             "sgpa": sgpa,
-            "subjects": subjects
+            "subjects": []   # ← ready for per-subject marks
         })
 
     return students
 
 
-# ---------- ROUTES ----------
-
+# -------------------------------
+# API ROUTE
+# -------------------------------
 @app.route("/parse", methods=["POST"])
 def parse_pdf():
     if "file" not in request.files:
-        return jsonify({"status": "error", "message": "No file uploaded"}), 400
+        return jsonify({"error": "No file uploaded"}), 400
 
-    file = request.files["file"]
+    pdf_file = request.files["file"]
 
-    text = ""
-    with pdfplumber.open(io.BytesIO(file.read())) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        pdf_file.save(tmp.name)
+        pdf_path = tmp.name
 
-    students = extract_students_from_text(text)
+    try:
+        text = extract_text_from_pdf(pdf_path)
+        students = extract_students_from_text(text)
 
-    return jsonify({
-        "status": "success",
-        "students": students,
-        "students_found": len(students)
-    })
+        return jsonify({
+            "status": "success",
+            "students_found": len(students),
+            "students": students
+        })
+
+    finally:
+        os.remove(pdf_path)
 
 
-@app.route("/")
-def health():
-    return "RMU PDF Parser is running"
+# -------------------------------
+# ENTRY POINT (Railway)
+# -------------------------------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000)
