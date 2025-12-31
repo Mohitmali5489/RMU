@@ -65,9 +65,7 @@
       formData.append("file", fileInput.files[0]);
 
       try {
-        const response = await fetch(
-          "rmu-production.up.railway.app/parse",
-          {
+        const response = await fetch("https://rmu-production.up.railway.app/parse", {
             method: "POST",
             body: formData
           }
