@@ -1,161 +1,127 @@
-import pdfplumber
 import re
-import os
-import tempfile
+import io
+import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import pdfplumber
 
 app = Flask(__name__)
 CORS(app)
 
-def parse_office_register(pdf_path):
-    students = []
-    
-    with pdfplumber.open(pdf_path) as pdf:
+# ---------------------------
+# REGEX PATTERNS (IMPORTANT)
+# ---------------------------
+
+SEAT_NAME_PATTERN = re.compile(
+    r"(?P<seat>\d{7,})\s+(?P<name>[A-Z\s]+?)\s+(Regular|ATKT|FAIL|PASS)",
+    re.MULTILINE
+)
+
+GENDER_PATTERN = re.compile(r"\b(MALE|FEMALE)\b")
+
+SUBJECT_PATTERN = re.compile(
+    r"(?P<code>\d{6,})\s+"
+    r"(?P<name>[A-Za-z &(),\-]+?)\s+"
+    r"(?P<int>\d{1,2}|--)\s+"
+    r"(?P<ext>\d{1,2}|--)\s+"
+    r"(?P<total>\d{1,3})\s+"
+    r"(?P<grade>[A-F][+]?|P|F)\s+"
+    r"(?P<credit>\d)",
+    re.MULTILINE
+)
+
+TOTAL_PATTERN = re.compile(
+    r"TOTAL\s+\(?\d+\)?\s+(?P<marks>\d{2,3})"
+)
+
+SGPA_PATTERN = re.compile(r"SGPA\s+(?P<sgpa>\d+\.\d+)")
+
+RESULT_PATTERN = re.compile(r"\b(PASS|FAIL|ATKT)\b")
+
+
+# ---------------------------
+# CORE PARSER
+# ---------------------------
+
+def parse_pdf(file_stream):
+    full_text = ""
+
+    with pdfplumber.open(file_stream) as pdf:
         for page in pdf.pages:
-            # 1. Cluster words into lines based on Y-position
-            words = page.extract_words(x_tolerance=3, y_tolerance=3)
-            lines = {}
-            for w in words:
-                y = round(w['top'] / 5) * 5
-                if y not in lines:
-                    lines[y] = []
-                lines[y].append(w)
-            
-            sorted_y_keys = sorted(lines.keys())
-            
-            current_student = None
-            
-            for y in sorted_y_keys:
-                line_words = sorted(lines[y], key=lambda w: w['x0'])
-                line_text = " ".join([w['text'] for w in line_words])
-                
-                # --- CRITICAL FIX: LEFT MARGIN CHECK ---
-                # Real Seat Numbers are always at the very start of the line (Left margin < 80)
-                # Course headers often appear, but we double-check the position of the first word.
-                first_word_x = float(line_words[0]['x0'])
-                
-                # Regex for 7-digit Seat Number
-                seat_match = re.match(r"^(\d{7})\b", line_text)
-                
-                # 1. Check if it looks like a seat number
-                # 2. Check if it's strictly on the left side (x < 80)
-                # 3. Exclude known header patterns (e.g. starts with parenthesis)
-                if seat_match and first_word_x < 80 and not line_text.startswith("("):
-                    
-                    if current_student:
-                        students.append(current_student)
-                    
-                    seat_no = seat_match.group(1)
-                    
-                    current_student = {
-                        "seat_no": seat_no,
-                        "name": "",
-                        "ern": "",
-                        "status": "Unknown",
-                        "total_marks": "N/A",
-                        "sgpa": "N/A",
-                        "result": "N/A"
-                    }
-                    
-                    # Extract Name (Remove Seat No)
-                    raw_name = line_text[len(seat_no):].strip()
-                    current_student["name"] = clean_name(raw_name)
+            txt = page.extract_text()
+            if txt:
+                full_text += "\n" + txt
 
-                # --- DATA EXTRACTION ---
-                if current_student:
-                    # Capture ERN
-                    ern_match = re.search(r"(MU\d{10,})", line_text)
-                    if ern_match and not current_student["ern"]:
-                        current_student["ern"] = ern_match.group(1)
-                    
-                    # Capture Name Continuation (Uppercase only, no numbers, not keywords)
-                    # We ensure we are NOT reading a header line by checking for digits
-                    if (not re.search(r"\d", line_text) 
-                        and len(line_text) > 3 
-                        and "COLLEGE" not in line_text 
-                        and "FEMALE" not in line_text 
-                        and "MALE" not in line_text):
-                        
-                        # Append if name seems short
-                        if len(current_student["name"].split()) < 3: 
-                            current_student["name"] += " " + line_text.strip()
+    students = []
+    matches = list(SEAT_NAME_PATTERN.finditer(full_text))
 
-                    # Status
-                    if "Regular" in line_text:
-                        current_student["status"] = "Regular"
-                    
-                    # Result
-                    if "PASS" in line_text:
-                        current_student["result"] = "PASS"
-                    elif "FAILED" in line_text or "FAILS" in line_text:
-                        current_student["result"] = "FAILED"
-                    elif "ABSENT" in line_text:
-                        current_student["result"] = "ABSENT"
-                    elif "RR" in line_text:
-                        current_student["result"] = "Reserved"
+    for idx, match in enumerate(matches):
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(full_text)
+        block = full_text[start:end]
 
-                    # SGPA (Look for float between 0.0 and 10.0 at end of blocks)
-                    # Exclude common credits like 2.00, 4.00, 20.00
-                    floats = re.findall(r"\b(\d+\.\d+)\b", line_text)
-                    for f in floats:
-                        val = float(f)
-                        if 0.0 < val <= 10.0 and val not in [2.0, 4.0, 20.0, 40.0, 50.0, 60.0, 100.0]:
-                            current_student["sgpa"] = f
+        seat_no = match.group("seat")
+        name = match.group("name").strip()
 
-                    # Total Marks (Pattern: (374))
-                    total_match = re.search(r"\((\d{3})\)", line_text)
-                    if total_match:
-                        current_student["total_marks"] = total_match.group(1)
+        gender_match = GENDER_PATTERN.search(block)
+        gender = gender_match.group(1) if gender_match else None
 
-            if current_student:
-                students.append(current_student)
+        result_match = RESULT_PATTERN.search(block)
+        result = result_match.group(1) if result_match else None
 
-    # Final Cleanup & Deduplication
-    final_data = []
-    seen_seats = set()
-    
-    for s in students:
-        s["name"] = clean_name(s["name"])
-        # Deduplication check
-        if s["seat_no"] not in seen_seats:
-            final_data.append(s)
-            seen_seats.add(s["seat_no"])
+        sgpa_match = SGPA_PATTERN.search(block)
+        sgpa = float(sgpa_match.group("sgpa")) if sgpa_match else None
 
-    return final_data
+        total_match = TOTAL_PATTERN.search(block)
+        total_marks = int(total_match.group("marks")) if total_match else None
 
-def clean_name(name_str):
-    # Remove noise
-    noise = ["FEMALE", "MALE", "Regular", "Student", "Previous", "Marks", "TOT", "Internal", "External", "College", "PRN"]
-    for w in noise:
-        name_str = re.sub(r'\b' + w + r'\b', '', name_str, flags=re.IGNORECASE)
-    
-    # Remove extra spaces
-    name_str = re.sub(r'\s+', ' ', name_str).strip()
-    return name_str
+        subjects = []
+        for sm in SUBJECT_PATTERN.finditer(block):
+            subjects.append({
+                "code": sm.group("code"),
+                "name": sm.group("name").strip(),
+                "internal": None if sm.group("int") == "--" else int(sm.group("int")),
+                "external": None if sm.group("ext") == "--" else int(sm.group("ext")),
+                "total": int(sm.group("total")),
+                "grade": sm.group("grade"),
+                "credit": int(sm.group("credit"))
+            })
+
+        students.append({
+            "seat_no": seat_no,
+            "name": name,
+            "gender": gender,
+            "status": "Regular",
+            "result": result,
+            "sgpa": sgpa,
+            "total_marks": total_marks,
+            "subjects": subjects
+        })
+
+    return {
+        "status": "success",
+        "students_found": len(students),
+        "students": students
+    }
+
+
+# ---------------------------
+# API ROUTE
+# ---------------------------
 
 @app.route("/parse", methods=["POST"])
-def parse_pdf():
+def parse_endpoint():
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
 
     file = request.files["file"]
-    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    file.save(temp.name)
-    temp.close()
+    data = parse_pdf(io.BytesIO(file.read()))
+    return jsonify(data)
 
-    try:
-        data = parse_office_register(temp.name)
-        return jsonify({
-            "status": "success",
-            "count": len(data),
-            "data": data
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        if os.path.exists(temp.name):
-            os.unlink(temp.name)
+
+# ---------------------------
+# START SERVER
+# ---------------------------
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=8000)
