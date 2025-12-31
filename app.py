@@ -18,37 +18,53 @@ def parse_pdf():
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     file.save(temp.name)
 
-    full_text = ""
+    lines = []
 
+    # ---- Extract text line-by-line ----
     with pdfplumber.open(temp.name) as pdf:
         for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                full_text += "\n" + t
+            text = page.extract_text()
+            if text:
+                for l in text.splitlines():
+                    clean = re.sub(r"\s+", " ", l).strip()
+                    if clean:
+                        lines.append(clean)
 
     os.unlink(temp.name)
 
     students = []
     seen = set()
 
-    for line in full_text.splitlines():
-        line = re.sub(r"\s+", " ", line).strip()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
 
-        # Matches:
-        # 262112705 MOHIT BHARAT MALI Regular MALE MU0341...
-        m = re.match(
-            r"^(\d{7,})\s+([A-Z][A-Z\s]+?)\s+(Regular|PRIVATE)\s+(MALE|FEMALE)\s+(MU\d+)",
-            line
-        )
+        # Seat number = standalone 7+ digit number
+        if re.fullmatch(r"\d{7,}", line):
+            seat_no = line
 
-        if m:
-            seat_no = m.group(1)
-            name = m.group(2).strip()
-            status = m.group(3)
-            gender = m.group(4)
-            ern = m.group(5)
+            name = ""
+            gender = ""
+            ern = ""
+            status = ""
 
-            if seat_no not in seen:
+            # Look ahead safely
+            for j in range(i + 1, min(i + 8, len(lines))):
+                l = lines[j]
+
+                if not name and re.fullmatch(r"[A-Z][A-Z\s]{3,}", l):
+                    name = l
+
+                if not gender and l in ("MALE", "FEMALE"):
+                    gender = l
+
+                if not ern and re.match(r"MU\d{10,}", l):
+                    ern = l
+
+                if not status and l.upper() in ("REGULAR", "PRIVATE"):
+                    status = l.title()
+
+            if seat_no not in seen and name:
                 students.append({
                     "seat_no": seat_no,
                     "name": name,
@@ -57,6 +73,8 @@ def parse_pdf():
                     "ern": ern
                 })
                 seen.add(seat_no)
+
+        i += 1
 
     return jsonify({
         "status": "success",
