@@ -9,39 +9,53 @@ CORS(app)
 
 # ---------- HELPERS ----------
 
-def clean(text):
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def extract_students_from_text(text):
     students = []
 
-    # Each student starts with seat number (7–8 digits)
-    blocks = re.split(r"\n(?=\d{7,8}\s+[A-Z])", text)
+    # 🔒 Only process text AFTER student table header
+    header_match = re.search(
+        r"SEAT NO\s+NAME\s+STATUS\s+GENDER\s+ERN\s+COLLEGE",
+        text
+    )
+    if not header_match:
+        return students
+
+    text = text[header_match.end():]
+
+    # Split by real student seat numbers (7–8 digits, newline before)
+    blocks = re.split(r"\n(?=\d{7,8}\s+[A-Z]{2,}\s+[A-Z]{2,})", text)
 
     for block in blocks:
         block = block.strip()
-        if not re.match(r"^\d{7,8}", block):
+
+        # ❌ Skip subject header rows
+        if ":" in block:
             continue
 
-        lines = block.split("\n")
-
-        # --- Seat No & Name ---
-        m = re.match(r"^(\d{7,8})\s+([A-Z ]+)", lines[0])
+        # --- Seat No + Full Name ---
+        m = re.match(r"^(\d{7,8})\s+([A-Z]{2,}(?:\s+[A-Z]{2,})+)", block)
         if not m:
             continue
 
         seat_no = m.group(1)
-        name = clean(m.group(2))
+        name = m.group(2).strip()
 
         # --- Gender ---
-        gender = "MALE" if " MALE " in block else "FEMALE" if " FEMALE " in block else None
+        gender = None
+        if re.search(r"\bMALE\b", block):
+            gender = "MALE"
+        elif re.search(r"\bFEMALE\b", block):
+            gender = "FEMALE"
 
         # --- Status ---
         status = "Regular" if " Regular " in block else None
 
         # --- Result ---
-        result = "PASS" if " PASS " in block else "FAIL" if " FAIL " in block else None
+        result = None
+        if re.search(r"\bPASS\b", block):
+            result = "PASS"
+        elif re.search(r"\bFAIL\b", block):
+            result = "FAIL"
 
         # --- Total Marks ---
         total_marks = None
@@ -59,19 +73,18 @@ def extract_students_from_text(text):
         college = None
         col = re.search(r"MU-\d+:(.+)", block)
         if col:
-            college = clean(col.group(1))
+            college = col.group(1).strip()
 
         # --- Subjects ---
         subjects = []
         subject_pattern = re.compile(
-            r"(\d{6,7})\s+([A-Za-z &()-]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+([A+BCDEF]+)\s+(\d+)",
-            re.MULTILINE
+            r"(\d{6,7})\s+([A-Za-z &()-]+)\s+(\d+)\s+(\d+)\s+(\d+)\s+([A+BCDEF]+)\s+(\d+)"
         )
 
         for sm in subject_pattern.finditer(block):
             subjects.append({
                 "code": sm.group(1),
-                "name": clean(sm.group(2)),
+                "name": sm.group(2).strip(),
                 "internal": int(sm.group(3)),
                 "external": int(sm.group(4)),
                 "total": int(sm.group(5)),
