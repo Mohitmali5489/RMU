@@ -21,6 +21,7 @@ def parse_pdf():
 
     students = []
     current_student = None
+    pending_subject = None
 
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -33,23 +34,19 @@ def parse_pdf():
 
                 for line in lines:
 
-                    # -----------------------------
-                    # 1️⃣ STUDENT HEADER ROW
-                    # Example:
-                    # 262112648 AAKANSHSA PANDURANG DHONE Regular FEMALE MU034112...
-                    # -----------------------------
+                    # -------------------------------------------------
+                    # 1️⃣ STUDENT HEADER
+                    # -------------------------------------------------
                     student_match = re.match(
                         r"^(\d{9})\s+([A-Z\s]+?)\s+(Regular|Repeater)\s+(MALE|FEMALE)",
                         line
                     )
 
                     if student_match:
-                        # Save previous student
                         if current_student:
                             students.append(current_student)
 
                         seat_no, name, status, gender = student_match.groups()
-
                         current_student = {
                             "seat_no": seat_no,
                             "name": name.strip(),
@@ -60,48 +57,65 @@ def parse_pdf():
                             "result": None,
                             "sgpa": None
                         }
+                        pending_subject = None
                         continue
 
-                    # -----------------------------
-                    # 2️⃣ SUBJECT ROW
-                    # Example:
-                    # 1162111 Financial Accounting - II 36 B+ 4
-                    # -----------------------------
-                    if current_student:
-                        subject_match = re.match(
-                            r"^(\d{6,7})\s+(.+?)\s+(\d{1,3})\s+([A-F][\+\-]?)\s+(\d+)$",
+                    if not current_student:
+                        continue
+
+                    # -------------------------------------------------
+                    # 2️⃣ SUBJECT CODE + NAME
+                    # -------------------------------------------------
+                    subj_header = re.match(
+                        r"^(\d{6,7})\s+(.+?)(?:\s+\(THEORY\))?$",
+                        line
+                    )
+
+                    if subj_header:
+                        code, name = subj_header.groups()
+                        pending_subject = {
+                            "code": code,
+                            "name": name.strip(),
+                            "marks": None,
+                            "grade": None,
+                            "credits": None
+                        }
+                        continue
+
+                    # -------------------------------------------------
+                    # 3️⃣ SUBJECT MARKS / GRADE / CREDITS
+                    # Example line contains: 36 B+ 4
+                    # -------------------------------------------------
+                    if pending_subject:
+                        marks_match = re.search(
+                            r"\b(\d{1,3})\s+([A-F][\+\-]?)\s+(\d+)\b",
                             line
                         )
+                        if marks_match:
+                            marks, grade, credits = marks_match.groups()
+                            pending_subject["marks"] = int(marks)
+                            pending_subject["grade"] = grade
+                            pending_subject["credits"] = int(credits)
 
-                        if subject_match:
-                            code, name, marks, grade, credits = subject_match.groups()
-                            current_student["subjects"].append({
-                                "code": code,
-                                "name": name.strip(),
-                                "marks": int(marks),
-                                "grade": grade,
-                                "credits": int(credits)
-                            })
+                            current_student["subjects"].append(pending_subject)
+                            pending_subject = None
                             continue
 
-                    # -----------------------------
-                    # 3️⃣ TOTAL / RESULT ROW
-                    # Example:
-                    # TOTAL 382 PASS 7.45
-                    # -----------------------------
-                    if current_student:
-                        total_match = re.search(
-                            r"TOTAL\s+(\d+)\s+(PASS|FAIL)\s+([\d\.]+)",
-                            line
-                        )
-                        if total_match:
-                            total, result, sgpa = total_match.groups()
-                            current_student["total_marks"] = int(total)
-                            current_student["result"] = result
-                            current_student["sgpa"] = float(sgpa)
-                            continue
+                    # -------------------------------------------------
+                    # 4️⃣ TOTAL / RESULT / SGPA
+                    # -------------------------------------------------
+                    total_match = re.search(
+                        r"TOTAL\s+(\d+)\s+(PASS|FAIL)\s+([\d\.]+)",
+                        line
+                    )
 
-        # Append last student
+                    if total_match:
+                        total, result, sgpa = total_match.groups()
+                        current_student["total_marks"] = int(total)
+                        current_student["result"] = result
+                        current_student["sgpa"] = float(sgpa)
+                        continue
+
         if current_student:
             students.append(current_student)
 
