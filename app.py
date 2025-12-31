@@ -7,96 +7,109 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-SEAT_LINE = re.compile(r"^(\d{9})\s+([A-Z ]+)\s+(MALE|FEMALE)", re.M)
-RESULT_LINE = re.compile(r"\b(PASS|FAIL)\b")
+# ---------- HELPERS ----------
 
-SUBJECT_HEADER = re.compile(r"(\d{6})\s*:\s*([A-Za-z &()\-]+)")
+def clean(s):
+    return re.sub(r"\s+", " ", s).strip()
 
-def extract_text(pdf_bytes):
-    text = ""
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                text += "\n" + t
-    return text
+def parse_subject_row(row):
+    """
+    Example row in PDF:
+    1162111 Financial Accounting - II (THEORY)
+    External 60/24  Internal 40/16  TOT 40  G A+  C 6  G*C 36
+    """
+    subject = {}
+
+    # Subject code + name
+    m = re.search(r"(\d{6,7})\s+(.+?)\s+\(", row)
+    if not m:
+        return None
+
+    subject["code"] = m.group(1)
+    subject["name"] = clean(m.group(2))
+
+    # Marks
+    ext = re.search(r"External\s+\((\d+)/(\d+)\)", row)
+    inte = re.search(r"Internal\s+\((\d+)/(\d+)\)", row)
+    tot = re.search(r"TOT\s+(\d+)", row)
+    grade = re.search(r"G\s+([A-F][+]?|\w+)", row)
+    credits = re.search(r"C\s+(\d+)", row)
+
+    subject["external_max"] = int(ext.group(1)) if ext else None
+    subject["external_marks"] = int(ext.group(2)) if ext else None
+    subject["internal_max"] = int(inte.group(1)) if inte else None
+    subject["internal_marks"] = int(inte.group(2)) if inte else None
+    subject["total"] = int(tot.group(1)) if tot else None
+    subject["grade"] = grade.group(1) if grade else None
+    subject["credits"] = int(credits.group(1)) if credits else None
+
+    return subject
 
 
-def parse_subject_headers(text):
-    subjects = []
-    for m in SUBJECT_HEADER.finditer(text):
-        subjects.append({
-            "code": m.group(1),
-            "name": m.group(2).strip()
-        })
-    return subjects
+# ---------- MAIN PARSER ----------
 
-
-def parse_students(text, subject_headers):
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
+def parse_pdf(pdf_bytes):
     students = []
-    i = 0
 
-    while i < len(lines):
-        m = SEAT_LINE.match(lines[i])
-        if not m:
-            i += 1
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        full_text = "\n".join(
+            page.extract_text() or "" for page in pdf.pages
+        )
+
+    # Split per student (Seat No is reliable anchor)
+    student_blocks = re.split(r"\n(?=\d{7}\s+[A-Z])", full_text)
+
+    for block in student_blocks:
+        seat = re.search(r"(\d{7})", block)
+        name = re.search(r"\d{7}\s+([A-Z\s]+)", block)
+        gender = re.search(r"\b(MALE|FEMALE)\b", block)
+        result = re.search(r"\b(PASS|FAIL|ATKT)\b", block)
+        sgpa = re.search(r"SGPA\s*[:\-]?\s*([\d.]+)", block)
+        total = re.search(r"TOTAL\s*\(?\d+\)?\s*([\d.]+)", block)
+
+        if not seat or not name:
             continue
 
-        seat_no, name, gender = m.groups()
         student = {
-            "seat_no": seat_no,
-            "name": name.strip(),
-            "gender": gender,
-            "result": None,
+            "seat_no": seat.group(1),
+            "name": clean(name.group(1)),
+            "gender": gender.group(1) if gender else None,
+            "result": result.group(1) if result else None,
+            "sgpa": float(sgpa.group(1)) if sgpa else None,
+            "total_marks": float(total.group(1)) if total else None,
             "subjects": []
         }
 
-        # Result line (next 5 lines ke andar hota hai)
-        for j in range(i, min(i + 6, len(lines))):
-            r = RESULT_LINE.search(lines[j])
-            if r:
-                student["result"] = r.group(1)
-                break
+        # SUBJECT TABLE PARSING
+        subject_rows = re.findall(
+            r"\d{6,7}.*?G\s+[A-F][+]?.*?G\*C\s+\d+",
+            block,
+            flags=re.S
+        )
 
-        # Marks line (usually 2-3 lines neeche)
-        marks_line = None
-        for j in range(i + 1, i + 10):
-            if j < len(lines) and re.search(r"\b\d+\s+\d+\s+\d+\s+[A-F][+]?|\b--\s+--\s+\d+", lines[j]):
-                marks_line = lines[j]
-                break
-
-        if marks_line:
-            cols = re.split(r"\s+", marks_line)
-            idx = 0
-            for sub in subject_headers:
-                if idx + 3 >= len(cols):
-                    break
-                student["subjects"].append({
-                    "code": sub["code"],
-                    "name": sub["name"],
-                    "internal": None if cols[idx] == "--" else int(cols[idx]),
-                    "external": None if cols[idx + 1] == "--" else int(cols[idx + 1]),
-                    "total": int(cols[idx + 2]),
-                    "grade": cols[idx + 3]
-                })
-                idx += 4
+        for row in subject_rows:
+            sub = parse_subject_row(row)
+            if sub:
+                student["subjects"].append(sub)
 
         students.append(student)
-        i += 1
 
     return students
 
 
+# ---------- ROUTES ----------
+
+@app.route("/", methods=["GET"])
+def health():
+    return {"status": "ok"}
+
 @app.route("/parse", methods=["POST"])
-def parse_pdf():
+def parse():
     if "file" not in request.files:
-        return jsonify({"error": "No file"}), 400
+        return jsonify({"error": "PDF not provided"}), 400
 
     pdf_bytes = request.files["file"].read()
-    text = extract_text(pdf_bytes)
-    subject_headers = parse_subject_headers(text)
-    students = parse_students(text, subject_headers)
+    students = parse_pdf(pdf_bytes)
 
     return jsonify({
         "status": "success",
@@ -105,5 +118,7 @@ def parse_pdf():
     })
 
 
+# ---------- ENTRY ----------
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    app.run(host="0.0.0.0", port=8080)
