@@ -6,7 +6,7 @@ import os
 import re
 
 app = Flask(__name__)
-CORS(app)  # Allow GitHub Pages / Railway frontend
+CORS(app)
 
 @app.route("/parse", methods=["POST"])
 def parse_pdf():
@@ -15,62 +15,48 @@ def parse_pdf():
 
     file = request.files["file"]
 
-    # Save PDF temporarily
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     file.save(temp.name)
 
     full_text = ""
 
-    # Extract ALL text from ALL pages
     with pdfplumber.open(temp.name) as pdf:
         for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                full_text += "\n" + text
+            t = page.extract_text()
+            if t:
+                full_text += "\n" + t
 
     os.unlink(temp.name)
 
-    lines = full_text.splitlines()
     students = []
-    seen_seats = set()
+    seen = set()
 
-    # ------------------------------------------------
-    # STEP 1: Extract SEAT NO + NAME (CORRECT METHOD)
-    # ------------------------------------------------
-    for line in lines:
+    for line in full_text.splitlines():
         line = re.sub(r"\s+", " ", line).strip()
 
         # Matches:
-        # 262112705 MOHIT BHARAT MALI
-        match = re.match(r"^(\d{7,})\s+([A-Z][A-Z\s]{3,})$", line)
+        # 262112705 MOHIT BHARAT MALI Regular MALE MU0341...
+        m = re.match(
+            r"^(\d{7,})\s+([A-Z][A-Z\s]+?)\s+(Regular|PRIVATE)\s+(MALE|FEMALE)\s+(MU\d+)",
+            line
+        )
 
-        if match:
-            seat_no = match.group(1)
-            name = match.group(2).strip()
+        if m:
+            seat_no = m.group(1)
+            name = m.group(2).strip()
+            status = m.group(3)
+            gender = m.group(4)
+            ern = m.group(5)
 
-            # Avoid duplicates
-            if seat_no not in seen_seats:
+            if seat_no not in seen:
                 students.append({
                     "seat_no": seat_no,
                     "name": name,
-                    "ern": "",
-                    "gender": ""
+                    "status": status,
+                    "gender": gender,
+                    "ern": ern
                 })
-                seen_seats.add(seat_no)
-
-    # ------------------------------------------------
-    # STEP 2: Attach ERN + GENDER per student
-    # ------------------------------------------------
-    for student in students:
-        pattern = (
-            student["seat_no"]
-            + r".*?(MU\d{10,}).*?\b(MALE|FEMALE)\b"
-        )
-
-        m = re.search(pattern, full_text, re.S)
-        if m:
-            student["ern"] = m.group(1)
-            student["gender"] = m.group(2)
+                seen.add(seat_no)
 
     return jsonify({
         "status": "success",
