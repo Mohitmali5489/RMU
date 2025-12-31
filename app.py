@@ -20,14 +20,12 @@ def parse_pdf():
 
     words = []
 
-    # -------- Extract WORDS (not lines) --------
     with pdfplumber.open(temp.name) as pdf:
         for page in pdf.pages:
-            page_words = page.extract_words(use_text_flow=True)
-            for w in page_words:
-                text = w["text"].strip()
-                if text:
-                    words.append(text)
+            for w in page.extract_words(use_text_flow=True):
+                t = w["text"].strip()
+                if t:
+                    words.append(t)
 
     os.unlink(temp.name)
 
@@ -38,16 +36,14 @@ def parse_pdf():
     while i < len(words):
         word = words[i]
 
-        # Seat number = 7+ digit number
         if re.fullmatch(r"\d{7,}", word):
             seat_no = word
             name_parts = []
             gender = ""
-            ern = ""
             status = ""
+            ern = ""
 
-            # Look ahead next 15 words
-            for j in range(i + 1, min(i + 15, len(words))):
+            for j in range(i + 1, min(i + 18, len(words))):
                 w = words[j]
 
                 if w in ("MALE", "FEMALE"):
@@ -64,17 +60,23 @@ def parse_pdf():
 
             name = " ".join(name_parts).strip()
 
-            if seat_no not in seen and name:
+            # -------- STRICT VALIDATION --------
+            if (
+                seat_no not in seen
+                and gender in ("MALE", "FEMALE")
+                and status
+                and len(name.split()) >= 2
+            ):
                 students.append({
                     "seat_no": seat_no,
                     "name": name,
-                    "status": status,
                     "gender": gender,
+                    "status": status,
                     "ern": ern
                 })
                 seen.add(seat_no)
 
-            i += 15
+            i += 18
         else:
             i += 1
 
